@@ -13,6 +13,10 @@ Current-state tracker. See `alpine/lessons-learned.md` for the full narrative be
 - `build-apkovl.sh` — first-boot SSH overlay, 4 real bugs found and fixed.
 - `build-answerfile.sh` + `offline-install-prep.sh` — full CLI automation of `setup-alpine`'s disk install, no internet needed (backed by vendored `apks-extra/` local repo, self-signed).
 
+## Known gaps
+
+- **`/etc/apk/repositories` is non-functional on the resulting installed system.** Confirmed by inspecting a real installed device: both lines are present but commented out, still pointing at the tmpfs paths (`/root/apks-cache`, `/root/apks-extra`) used transiently during the offline install — those don't exist post-reboot. `apk add anything` won't work out of the box, even once the device has real internet in the field. A downstream provisioning step needs to point this at a real mirror first (e.g. `setup-apkrepos -1`, or hand-write a `dl-cdn.alpinelinux.org` line) before installing any app-specific packages.
+
 ## Open / not yet exercised
 
 - DHCP/same-LAN path (only direct-cable static IP tested so far).
