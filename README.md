@@ -32,7 +32,9 @@ More distro folders (e.g. `raspios/`) can be added later if a project needs one 
 
 ## Status
 
-**Not yet confirmed end-to-end.** The Alpine flow here is carried over from a real flash session on `mobile_aprs_gateway` that ended without a confirmed successful headless boot on a fresh card — see `alpine/lessons-learned.md` for exactly where that session left off. Treat this as "best current understanding, actively being hardened," not a proven recipe, until a session closes that loop.
+**Ethernet path confirmed end-to-end on Pi 3B+ (2026-08-01).** Blank SD card → headless first-boot SSH → fully CLI-automated `setup-alpine` disk install → persistent, disk-booted, SSH-accessible Alpine system, with zero interactive steps and zero internet access needed at flash-time. See `alpine/lessons-learned.md` for the full story, including four real bugs found and fixed along the way.
+
+**Not yet done:** WiFi AP mode (the "OR AP" half of milestone 1 — Pi hosting its own access point for headless access with no Ethernet available), and validation on Pi 4/5 (the boot-layout fix so far is confirmed for Pi 3B+ specifically).
 
 ---
 

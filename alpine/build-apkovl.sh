@@ -46,6 +46,8 @@
 
 set -e
 
+SCRIPTDIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
 PUBKEY="$1"
 OUTDIR="${2:-.}"
 STATIC_IP="$3"
@@ -59,15 +61,70 @@ if [ ! -f "$PUBKEY" ]; then
     echo "Pubkey file not found: $PUBKEY" >&2
     exit 1
 fi
+if [ ! -d "$OUTDIR" ]; then
+    echo "Output dir not found: $OUTDIR" >&2
+    exit 1
+fi
+
+# Resolve to absolute before the tar step below cd's into WORKDIR — a
+# relative OUTDIR would otherwise resolve against WORKDIR post-cd and get
+# silently deleted by the EXIT trap, discarding the output with no error.
+OUTDIR=$(cd "$OUTDIR" && pwd)
 
 WORKDIR=$(mktemp -d)
 trap 'rm -rf "$WORKDIR"' EXIT
 
+mkdir -p "$WORKDIR/etc/apk/keys"
 mkdir -p "$WORKDIR/etc/network"
 mkdir -p "$WORKDIR/etc/runlevels/default"
 mkdir -p "$WORKDIR/root/.ssh"
 
 echo "localhost" > "$WORKDIR/etc/hostname"
+
+# Marker (existence-only, content ignored) telling mkinitfs's diskless-boot
+# init to add its own standard baseline services — devfs/dmesg/mdev/hwdrivers
+# /modloop (sysinit), modules/sysctl/hostname/bootmisc/syslog (boot), clean
+# shutdown handling — that a from-scratch minimal apkovl like this one
+# otherwise skips entirely. Without it, modloop (the kernel-modules squashfs)
+# never gets mounted, and setup-alpine's disk-install step fails outright
+# with "mountpoint: /.modloop: No such file or directory". Self-cleaning:
+# mkinitfs removes this file from the running system once it's acted on it,
+# so nothing lingers on the persistent install.
+touch "$WORKDIR/etc/.default_boot_services"
+
+# Enabling the sshd runlevel symlink alone isn't enough — the diskless-boot
+# init (mkinitfs's initramfs-init) only installs packages listed in
+# etc/apk/world from the apkovl. Without this, /etc/init.d/sshd never gets
+# installed in the first place, the runlevel symlink dangles, and sshd never
+# starts (network comes up fine, but the port is never listening). Confirmed
+# by reading initramfs-init.in directly: pkgs accumulate from
+# "$sysroot"/etc/apk/world, then `apk add --root $sysroot ... $pkgs` runs
+# against the local apks/ repo already on the boot partition (has a full
+# APKINDEX, so apk's install_if resolution — which is what actually pulls in
+# openssh-server-common-openrc, the package owning /etc/init.d/sshd — works
+# offline). openssh-server alone is enough; sshd doesn't need the ssh client.
+echo "openssh-server" > "$WORKDIR/etc/apk/world"
+
+# Trust key for this repo's own supplemental local package repo
+# (apks-extra/ — packages setup-disk needs that Alpine's own RPi tarball
+# doesn't ship locally: dosfstools, linux-rpi, raspberrypi-bootloader, etc.
+# See lessons-learned.md). Safe to always include: mkinitfs's diskless-boot
+# init only auto-generates etc/apk/repositories when the apkovl doesn't
+# already ship one (it never touches etc/apk/keys/ either way), so baking
+# the key in here has no ordering hazard. The matching private key is NOT
+# in this repo — see apks-extra/README.md.
+if [ -f "$SCRIPTDIR/apks-extra/minimal_pi-install.rsa.pub" ]; then
+    cp "$SCRIPTDIR/apks-extra/minimal_pi-install.rsa.pub" "$WORKDIR/etc/apk/keys/"
+fi
+
+# offline-install-prep.sh: run this over the first-boot SSH session, before
+# setup-alpine, to copy the local apk repos into tmpfs (they'd otherwise
+# vanish when setup-disk unmounts the boot media to repartition it). Baked
+# in here so it's present automatically, no separate copy step.
+if [ -f "$SCRIPTDIR/offline-install-prep.sh" ]; then
+    cp "$SCRIPTDIR/offline-install-prep.sh" "$WORKDIR/root/offline-install-prep.sh"
+    chmod 755 "$WORKDIR/root/offline-install-prep.sh"
+fi
 
 if [ -n "$STATIC_IP" ]; then
     cat > "$WORKDIR/etc/network/interfaces" <<EOF
@@ -97,7 +154,14 @@ ln -sf /etc/init.d/sshd "$WORKDIR/etc/runlevels/default/sshd"
 ln -sf /etc/init.d/networking "$WORKDIR/etc/runlevels/default/networking"
 
 OUTFILE="$OUTDIR/localhost.apkovl.tar.gz"
-( cd "$WORKDIR" && tar czf "$OUTFILE" etc root )
+# --uid/--gid/--uname/--gname force root:root ownership in the archive.
+# Without this, tar stores whatever local user built the apkovl (this script
+# never runs as root on the Mac), and unpacking that as root on the Pi during
+# boot preserves those non-root numeric IDs verbatim — so /root/.ssh ends up
+# NOT owned by root. sshd's StrictModes (on by default) then silently
+# rejects the key: no error, just "Permission denied (publickey)" with a
+# perfectly correct-looking key and file permission bits.
+( cd "$WORKDIR" && tar czf "$OUTFILE" --uid 0 --gid 0 --uname root --gname root etc root )
 
 echo "==> Wrote $OUTFILE"
 echo "    Copy/verify it sits at the ROOT of the boot (FAT) partition,"

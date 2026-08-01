@@ -4,7 +4,7 @@ Gets a truly blank SD card to a headless, SSH-accessible, persistently-installed
 
 Primary instructions are for a Mac. Windows/Linux notes are called out briefly where the steps differ.
 
-**Status:** not yet confirmed working end-to-end on a truly fresh card — see `lessons-learned.md` before relying on this for a real deployment.
+**Status:** confirmed working end-to-end on a Pi 3B+ (2026-08-01) — blank card through to a persistent, disk-booted, SSH-accessible system, fully CLI-automated with no interactive steps and no internet access needed at flash-time. See `lessons-learned.md` for the full story (including several real bugs found and fixed) and for what's still unconfirmed (Pi 4/5, the DHCP path, WiFi AP mode).
 
 ---
 
@@ -41,17 +41,16 @@ curl -LO https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-rpi
 
 ```sh
 diskutil list                    # identify the card, e.g. /dev/disk4 — double-check this!
-diskutil unmountDisk /dev/disk4
-sudo diskutil eraseDisk MS-DOS BOOT MBRFormat /dev/disk4
+sudo diskutil partitionDisk disk4 MBR "MS-DOS FAT32" BOOT 1G "Free Space" EMPTY R
 ```
 
-This gives a single FAT32 partition, MBR scheme, mounted at `/Volumes/BOOT`. That's the whole layout needed up front — the Pi boots this diskless (running from RAM) at first, so there's no need to pre-reserve space for a root partition. `setup-disk` (step 6) repartitions the card safely later while the OS is running entirely in memory.
+This creates a 1GB FAT32 boot partition (mounted at `/Volumes/BOOT`) and leaves the rest of the card as an explicit unformatted gap — plenty of room for the ~100MB of Alpine boot files plus this repo's `apks-extra/` (see step 3). Prefer this over `diskutil eraseDisk MS-DOS BOOT MBRFormat`, which formats the *entire* card as one FAT32 partition: FAT32 format time scales with the size of the partition being formatted, so on a large card (100GB+) that can take several minutes versus seconds for a 1GB partition. `setup-disk` (step 6) safely repartitions the *whole physical disk* later anyway while the OS is running entirely in memory, so the leftover free space isn't wasted or orphaned — this is fine for a real deployment, not just faster iteration while debugging.
 
 **Windows:** format the whole card FAT32/MBR via Disk Management or `diskpart`, then extract the tarball with 7-Zip.
 
 **Linux:** partition with `fdisk` (single partition, type `c` W95 FAT32 LBA), then `mkfs.vfat -F32 /dev/sdX1`.
 
-Same end state on all three: one FAT32 partition spanning the card.
+Same end state on all three: one FAT32 boot partition, MBR scheme.
 
 ---
 
@@ -62,6 +61,20 @@ tar xzf alpine-rpi-3.21.6-aarch64.tar.gz -C /Volumes/BOOT
 ```
 
 (No `sudo` needed — FAT32 doesn't preserve Unix ownership/permission bits, and extracting as a regular user works fine.)
+
+**Pi 3B+ (and possibly other models — see `lessons-learned.md`): flatten the boot file layout.** The raw tarball nests the kernel/initramfs under a `boot/` subdirectory, matching `config.txt`'s `kernel=boot/vmlinuz-rpi`. On a Pi 3B+ this doesn't boot at all — confirmed via the ACT LED's 7-flash "kernel not found" error code. Fix, before ever booting the card:
+
+```sh
+mv /Volumes/BOOT/boot/* /Volumes/BOOT/
+rmdir /Volumes/BOOT/boot
+sed -i '' 's#boot/vmlinuz-rpi#vmlinuz-rpi#; s#boot/initramfs-rpi#initramfs-rpi#' /Volumes/BOOT/config.txt
+```
+
+**Copy this repo's `apks-extra/` onto the card too**, for a fully offline `setup-alpine` disk install in step 6 (Alpine's own tarball doesn't ship everything `setup-disk` needs — see `lessons-learned.md`, "Offline package vendoring"):
+
+```sh
+cp -r apks-extra /Volumes/BOOT/
+```
 
 ---
 
@@ -104,24 +117,51 @@ Should work with no password — the apkovl already authorized your key.
 
 ---
 
-## 6. Run setup-alpine (interactive — not scriptable)
+## 6. Run setup-alpine (fully CLI-automated, no interactive session needed)
+
+`setup-alpine` supports a non-interactive answerfile mode that covers every step, including the disk install — no monitor/keyboard, no interactive SSH session required. This is where the real hostname gets set (`build-apkovl.sh` deliberately leaves it as `localhost` for the transient first-boot session — see step 4).
+
+All of this runs over the SSH session from step 5. First, make the local package repos survive `setup-disk` unmounting the boot media to repartition it (they otherwise vanish mid-install — see `lessons-learned.md`):
 
 ```sh
-setup-alpine
+ssh root@<pi-ip> "sh /root/offline-install-prep.sh"
 ```
 
-Answer the prompts: keyboard layout, hostname (pick the real one now — this is where it should actually be set, not baked into the apkovl), network interface (already up — accept), root password (set one, or leave blank for key-only login), timezone/NTP (choose "none" if this device will discipline its clock some other way, e.g. GPS), mirror (pick any), and finally:
+(`offline-install-prep.sh` is baked into the apkovl automatically by `build-apkovl.sh` — no separate copy needed.)
 
-- **Which disk(s) would you like to use?** → `mmcblk0`
-- **How would you like to use it?** → `sys`
+Then build and copy an answerfile (from your dev machine):
 
-It'll confirm it's about to erase the disk — say yes. This is safe: you're running from a RAM-resident diskless boot, so wiping the SD card underneath it doesn't touch the running system. It repartitions into boot (FAT32) + root (ext4), and carries forward the hostname/sshd/authorized_keys config from step 4.
+```sh
+sh build-answerfile.sh <hostname> . /dev/mmcblk0
+scp answerfile root@<pi-ip>:/root/answerfile
+```
 
-Reboot when it finishes. You now have a persistent, headless, SSH-accessible Alpine install — hand off to your project's own provisioning script from here.
+Then run the install itself, **detached** (`nohup` + background) rather than as a plain foreground SSH command — a long-running install tied directly to the SSH session is fragile against any transient link drop (see `lessons-learned.md`, "Hardware reliability"):
+
+```sh
+ssh root@<pi-ip> "nohup sh -c 'yes | setup-alpine -e -f /root/answerfile' > /root/setup-alpine.log 2>&1 < /dev/null &"
+```
+
+`-e` empties the root password (the one prompt the answerfile itself can't cover — this repo is key-only login by design). `yes` answers `setup-disk`'s unavoidable erase-confirmation prompt(s).
+
+Poll for completion (reconnecting is fine even if the link drops mid-install — the process survives independently once detached):
+
+```sh
+ssh root@<pi-ip> "pgrep -f 'setup-alpine -e -f' || tail -20 /root/setup-alpine.log"
+```
+
+Look for `Installation is complete. Please reboot.` at the end of the log, then:
+
+```sh
+ssh root@<pi-ip> "reboot"
+```
+
+You now have a persistent, headless, SSH-accessible Alpine install — hand off to your project's own provisioning script from here. (Prefer to do this by hand, interactively? Plain `setup-alpine` with no flags still works exactly as before — the automated path above is an addition, not a replacement.)
 
 ---
 
 ## Caveats
 
-- This whole procedure is based on documented Alpine RPi install flow and one real (inconclusive) flash session — not yet verified end-to-end on a truly blank card. See `lessons-learned.md` for exactly where that stands.
-- Initial headless access (steps 5–6) depends on eth0 for DHCP or a direct static link. Boards with no built-in ethernet (e.g. Pi Zero W) need a different apkovl with WiFi client credentials pre-baked in — not covered here yet.
+- Confirmed end-to-end on a Pi 3B+ via the direct-cable static-IP path (2026-08-01). The DHCP/same-LAN path and Pi 4/5 are believed to work the same way but not yet directly tested — see `lessons-learned.md`.
+- **Internet access is needed exactly once, on the machine flashing the card — never on the Pi itself, and never after step 3.** `apks-extra/` (step 3) exists specifically so step 6's disk install works with zero internet access on either machine. The resulting installed system doesn't need internet for headless SSH access at all, over Ethernet or AP.
+- Initial headless access (steps 5–6) depends on eth0 for DHCP or a direct static link. Boards with no built-in ethernet (e.g. Pi Zero W) need a different apkovl with WiFi client credentials pre-baked in — not covered here yet. WiFi AP mode (the Pi hosting its own access point) is also not yet covered — see `lessons-learned.md`.
