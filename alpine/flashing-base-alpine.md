@@ -6,6 +6,8 @@ Primary instructions are for a Mac. Windows/Linux notes are called out briefly w
 
 **Status:** confirmed working end-to-end on a Pi 3B+ (2026-08-01) — blank card through to a persistent, disk-booted, SSH-accessible system, fully CLI-automated with no interactive steps and no internet access needed at flash-time. See `lessons-learned.md` for the full story (including several real bugs found and fixed) and for what's still unconfirmed (Pi 4/5, the DHCP path, WiFi AP mode).
 
+**One-script version:** `flash-and-install.sh` runs every step below for the direct-cable static-IP case in one call — `bash flash-and-install.sh <hostname> <pubkey-file> <disk> <alpine-tarball>` (run with `bash` specifically, not `sh` — it uses bash arrays/process substitution that macOS's `/bin/sh` rejects; see the script's own header for the full argument list). Written 2026-08-01, not yet run against real hardware — see STATUS.md before trusting it over the manual steps below. The steps that follow are still the reference for what it's doing under the hood, and the fallback if it hits something it doesn't handle.
+
 ---
 
 ## 0. What you need

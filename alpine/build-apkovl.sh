@@ -24,7 +24,13 @@
 # into the overlay — no point setting it twice).
 #
 # Usage:
-#   sh build-apkovl.sh <pubkey-file> [output-dir] [static-ip] [netmask]
+#   sh build-apkovl.sh <pubkey-file> [output-dir] [static-ip] [netmask] [secondary-pubkey-file]
+#
+# secondary-pubkey-file is optional: a second key to also authorize for root,
+# appended as an extra line in authorized_keys. Useful when the user running
+# this script (e.g. a sudoer account needed for disk/network setup elsewhere
+# in the flow) isn't the same person who wants to SSH into the Pi afterward —
+# authorize both up front instead of hand-appending the second key later.
 #
 # If static-ip is omitted, eth0 uses DHCP — fine when the Pi and your
 # machine share a LAN with a router/switch in between (check the router's
@@ -52,13 +58,18 @@ PUBKEY="$1"
 OUTDIR="${2:-.}"
 STATIC_IP="$3"
 STATIC_NETMASK="${4:-255.255.0.0}"
+SECONDARY_PUBKEY="$5"
 
 if [ -z "$PUBKEY" ]; then
-    echo "Usage: sh build-apkovl.sh <pubkey-file> [output-dir] [static-ip] [netmask]" >&2
+    echo "Usage: sh build-apkovl.sh <pubkey-file> [output-dir] [static-ip] [netmask] [secondary-pubkey-file]" >&2
     exit 1
 fi
 if [ ! -f "$PUBKEY" ]; then
     echo "Pubkey file not found: $PUBKEY" >&2
+    exit 1
+fi
+if [ -n "$SECONDARY_PUBKEY" ] && [ ! -f "$SECONDARY_PUBKEY" ]; then
+    echo "Secondary pubkey file not found: $SECONDARY_PUBKEY" >&2
     exit 1
 fi
 if [ ! -d "$OUTDIR" ]; then
@@ -147,6 +158,14 @@ EOF
 fi
 
 cp "$PUBKEY" "$WORKDIR/root/.ssh/authorized_keys"
+if [ -n "$SECONDARY_PUBKEY" ]; then
+    # Blank line first regardless of whether $PUBKEY's file already ends in
+    # one — sshd ignores blank lines in authorized_keys, but a missing
+    # newline between the two would otherwise concatenate them onto one
+    # line and silently invalidate both.
+    echo "" >> "$WORKDIR/root/.ssh/authorized_keys"
+    cat "$SECONDARY_PUBKEY" >> "$WORKDIR/root/.ssh/authorized_keys"
+fi
 chmod 700 "$WORKDIR/root/.ssh"
 chmod 600 "$WORKDIR/root/.ssh/authorized_keys"
 
@@ -164,6 +183,9 @@ OUTFILE="$OUTDIR/localhost.apkovl.tar.gz"
 ( cd "$WORKDIR" && tar czf "$OUTFILE" --uid 0 --gid 0 --uname root --gname root etc root )
 
 echo "==> Wrote $OUTFILE"
+if [ -n "$SECONDARY_PUBKEY" ]; then
+    echo "    Authorized 2 keys for root: $PUBKEY and $SECONDARY_PUBKEY"
+fi
 echo "    Copy/verify it sits at the ROOT of the boot (FAT) partition,"
 echo "    eject the card, boot the Pi, then:"
 if [ -n "$STATIC_IP" ]; then
