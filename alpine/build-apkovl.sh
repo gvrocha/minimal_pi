@@ -7,12 +7,15 @@
 #
 # What it does: enables eth0 (DHCP by default, or a static address if given)
 # + sshd, and authorizes your SSH pubkey for root. That's the minimum needed
-# to get a shell with no monitor/keyboard. Everything else (hostname, users,
-# wifi, packages, whatever application the device will run) is deliberately
-# out of scope here — do it afterward over that first SSH session, via your
-# own project's provisioning script. Kept out of the overlay on purpose,
-# since a bad overlay can't be debugged without pulling the card and
-# re-mounting it.
+# to get a shell with no monitor/keyboard. Also always bakes in a static WiFi
+# AP on wlan0 (hostapd + dnsmasq, config from wifi-ap/) as an additional,
+# always-on interface — not an alternative to eth0, just a second way in when
+# no Ethernet is available (see STATUS.md, milestone 2). Everything else
+# (hostname, users, packages, whatever application the device will run) is
+# deliberately out of scope here — do it afterward over that first SSH
+# session, via your own project's provisioning script. Kept out of the
+# overlay on purpose, since a bad overlay can't be debugged without pulling
+# the card and re-mounting it.
 #
 # Hostname is intentionally NOT set here: Alpine's boot process looks for
 # "<resolved-hostname>.apkovl.tar.gz", and on a fresh boot with plain DHCP
@@ -72,6 +75,14 @@ if [ -n "$SECONDARY_PUBKEY" ] && [ ! -f "$SECONDARY_PUBKEY" ]; then
     echo "Secondary pubkey file not found: $SECONDARY_PUBKEY" >&2
     exit 1
 fi
+if [ ! -f "$SCRIPTDIR/wifi-ap/hostapd.conf" ]; then
+    echo "Missing $SCRIPTDIR/wifi-ap/hostapd.conf" >&2
+    exit 1
+fi
+if [ ! -f "$SCRIPTDIR/wifi-ap/dnsmasq.conf" ]; then
+    echo "Missing $SCRIPTDIR/wifi-ap/dnsmasq.conf" >&2
+    exit 1
+fi
 if [ ! -d "$OUTDIR" ]; then
     echo "Output dir not found: $OUTDIR" >&2
     exit 1
@@ -88,6 +99,7 @@ trap 'rm -rf "$WORKDIR"' EXIT
 mkdir -p "$WORKDIR/etc/apk/keys"
 mkdir -p "$WORKDIR/etc/network"
 mkdir -p "$WORKDIR/etc/runlevels/default"
+mkdir -p "$WORKDIR/etc/hostapd"
 mkdir -p "$WORKDIR/root/.ssh"
 
 echo "localhost" > "$WORKDIR/etc/hostname"
@@ -114,7 +126,12 @@ touch "$WORKDIR/etc/.default_boot_services"
 # APKINDEX, so apk's install_if resolution — which is what actually pulls in
 # openssh-server-common-openrc, the package owning /etc/init.d/sshd — works
 # offline). openssh-server alone is enough; sshd doesn't need the ssh client.
-echo "openssh-server" > "$WORKDIR/etc/apk/world"
+# hostapd/dnsmasq work the same way: install_if metadata on hostapd-openrc
+# (openrc hostapd=<ver>) and dnsmasq-openrc (openrc dnsmasq-common=<ver>)
+# means listing just the two parent packages is enough — apk's solver pulls
+# in dnsmasq-common (a hard dependency of dnsmasq) and both -openrc packages
+# automatically, same mechanism as openssh-server above.
+printf '%s\n' openssh-server hostapd dnsmasq > "$WORKDIR/etc/apk/world"
 
 # Trust key for this repo's own supplemental local package repo
 # (apks-extra/ — packages setup-disk needs that Alpine's own RPi tarball
@@ -137,6 +154,16 @@ if [ -f "$SCRIPTDIR/offline-install-prep.sh" ]; then
     chmod 755 "$WORKDIR/root/offline-install-prep.sh"
 fi
 
+# WiFi AP (milestone 2): always baked in as an additional interface, not an
+# alternative to eth0. hostapd.conf/dnsmasq.conf are static, repo-resident
+# config (placeholder SSID/passphrase — edit wifi-ap/ before flashing for
+# real use), copied by reference same as the trust key and
+# offline-install-prep.sh above. Presence already required near the top of
+# this script (unlike the trust key, wifi-ap/ is a permanent part of the
+# repo, not an optional artifact).
+cp "$SCRIPTDIR/wifi-ap/hostapd.conf" "$WORKDIR/etc/hostapd/hostapd.conf"
+cp "$SCRIPTDIR/wifi-ap/dnsmasq.conf" "$WORKDIR/etc/dnsmasq.conf"
+
 if [ -n "$STATIC_IP" ]; then
     cat > "$WORKDIR/etc/network/interfaces" <<EOF
 auto lo
@@ -157,6 +184,17 @@ iface eth0 inet dhcp
 EOF
 fi
 
+# wlan0 AP: unconditional, regardless of how eth0 above is configured.
+# 192.168.4.1/24 matches wifi-ap/dnsmasq.conf's dhcp-range (.10-.100) — this
+# address sits outside that pool, same /24.
+cat >> "$WORKDIR/etc/network/interfaces" <<'EOF'
+
+auto wlan0
+iface wlan0 inet static
+    address 192.168.4.1
+    netmask 255.255.255.0
+EOF
+
 cp "$PUBKEY" "$WORKDIR/root/.ssh/authorized_keys"
 if [ -n "$SECONDARY_PUBKEY" ]; then
     # Blank line first regardless of whether $PUBKEY's file already ends in
@@ -171,6 +209,13 @@ chmod 600 "$WORKDIR/root/.ssh/authorized_keys"
 
 ln -sf /etc/init.d/sshd "$WORKDIR/etc/runlevels/default/sshd"
 ln -sf /etc/init.d/networking "$WORKDIR/etc/runlevels/default/networking"
+# hostapd's depend() has "need net", dnsmasq's has "need localmount net" —
+# OpenRC's own resolver already orders interface-up before hostapd before
+# dnsmasq correctly with all four enabled in the same runlevel, no custom
+# depend() override needed (confirmed by reading both init scripts directly
+# out of the vendored -openrc packages).
+ln -sf /etc/init.d/hostapd "$WORKDIR/etc/runlevels/default/hostapd"
+ln -sf /etc/init.d/dnsmasq "$WORKDIR/etc/runlevels/default/dnsmasq"
 
 OUTFILE="$OUTDIR/localhost.apkovl.tar.gz"
 # --uid/--gid/--uname/--gname force root:root ownership in the archive.
@@ -200,3 +245,7 @@ fi
 echo ""
 echo "    Hostname isn't set yet — set it over this SSH session, after"
 echo "    setup-alpine has installed to disk (see flashing-base-alpine.md)."
+echo ""
+AP_SSID=$(sed -n 's/^ssid=//p' "$SCRIPTDIR/wifi-ap/hostapd.conf" | head -1)
+echo "    Also broadcasting WiFi AP '$AP_SSID' (see wifi-ap/hostapd.conf for"
+echo "    the passphrase) — ssh root@192.168.4.1 once connected to it."
